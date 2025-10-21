@@ -82,5 +82,8 @@ replay:
   turns: 100
 
 # Root folder for accessing file structure and modules
-root: '/Users/rgelpi/Documents/GitHub/transformers'
-log: True
+root: '/Users/nathanbaek/sorrel'
+log: False
+
+# root: '/Users/rgelpi/Documents/GitHub/transformers'
+# log: True

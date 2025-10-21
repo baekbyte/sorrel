@@ -16,7 +16,8 @@ elif current_path[-1] == 'RPG':
     root = os.path.abspath('../..')
 # Base case: specify the folder manually
 else:
-    root = os.path.abspath('/Users/rgelpi/Documents/GitHub/transformers') # Change the wd as needed.
+    root = os.path.abspath('/Users/nathanbaek/Documents/transformer') # Change the wd as needed.
+    # '/Users/rgelpi/Documents/GitHub/transformers'
 
 # Make sure the transformers directory is in PYTHONPATH
 if root not in sys.path:
