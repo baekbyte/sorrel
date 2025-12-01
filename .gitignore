@@ -149,3 +149,7 @@ examples/RPG/notebooks/runs/
 examples/RPG/models/checkpoints/
 examples/RPG/data
 gem/.DS_Store
+
+
+# Gif files
+*.gif
