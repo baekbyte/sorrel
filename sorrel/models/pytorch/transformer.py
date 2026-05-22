@@ -414,6 +414,7 @@ class VisionTransformer(nn.Module):
         dropout: float = 0.0,
         label_smoothing: float = 0.0,
         action_loss_weight: float = 1.0,
+        reward_loss_weight: float = 0.0,
     ):
         """Vision transformer adapted from StARFormer (https://github.com/elicassion/StARformer/tree/main)
         with adaptations from Phil Wang's ViT (https://github.com/lucidrains/vit-pytorch/tree/main).
@@ -458,6 +459,11 @@ class VisionTransformer(nn.Module):
         self.seed = seed
         self.label_smoothing = label_smoothing
         self.action_loss_weight = action_loss_weight
+        # Reward head weight. When 0.0 (default) the reward head is dormant and
+        # the model behaves exactly as the proven masked-reconstruction probe.
+        # Set > 0 to train the self/world-model objective (predict reward of the
+        # next transition off the global tokens).
+        self.reward_loss_weight = reward_loss_weight
 
         # (S, A) embedding
         self.token_embedding = JointEmbedding(
@@ -475,7 +481,9 @@ class VisionTransformer(nn.Module):
         # Num_layers = number of transformer blocks
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(layer_size, num_heads, self.num_patches, dropout=dropout)
+                TransformerBlock(
+                    layer_size, num_heads, self.num_patches, dropout=dropout
+                )
                 for _ in range(num_layers)
             ]
         ).to(self.device)
@@ -488,6 +496,11 @@ class VisionTransformer(nn.Module):
         self.action_head = nn.Linear(
             in_features=layer_size, out_features=action_space
         ).to(self.device)
+        # Reward head: predicts the scalar reward of the next transition from the
+        # normalized global tokens (the same (B, T, D) the action head consumes).
+        self.reward_head = nn.Linear(in_features=layer_size, out_features=1).to(
+            self.device
+        )
 
         # Optional agent identity embedding for Theory of Mind conditioning
         self.num_agents = num_agents
@@ -503,8 +516,16 @@ class VisionTransformer(nn.Module):
         states: torch.Tensor,
         actions: torch.Tensor,
         agent_id: int | torch.Tensor | None = None,
+        belief_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the transformer backbone and return normalized global tokens.
+
+        Args:
+            belief_embedding: Optional inferred goal/belief embedding of shape
+                (B, layer_size) or (B, T, layer_size), added to the global tokens
+                at the same injection point as the static agent identity embedding.
+                This is the Phase 2 hook: a feudal belief module produces this
+                vector from another agent's behavior to modulate a frozen base.
 
         Returns:
             x: Tensor of shape (B, T, layer_size).
@@ -526,6 +547,12 @@ class VisionTransformer(nn.Module):
                     .unsqueeze(0)
                 )
             global_tokens = global_tokens + agent_emb
+
+        # Inject inferred belief/goal embedding (Phase 2 conditioning)
+        if belief_embedding is not None:
+            if belief_embedding.dim() == 2:
+                belief_embedding = belief_embedding.unsqueeze(1)
+            global_tokens = global_tokens + belief_embedding
 
         local_tokens = self.local_dropout(local_tokens)
         global_tokens = self.global_dropout(global_tokens)
@@ -555,10 +582,11 @@ class VisionTransformer(nn.Module):
         states: torch.Tensor,
         actions: torch.Tensor,
         agent_id: int | torch.Tensor | None = None,
+        belief_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         B, T = states.size(0), states.size(1)
-        x = self._run_transformer(states, actions, agent_id)
+        x = self._run_transformer(states, actions, agent_id, belief_embedding)
         return self._apply_heads(x, B, T)
 
     def state_loss(
@@ -643,16 +671,25 @@ class VisionTransformer(nn.Module):
         Losses are computed on the ability to predict from given `S', A -> S", A'`
 
         Return:
-            (state_inputs, action_inputs, state_targets, action_targets, batch_agent_ids)
-            where batch_agent_ids is a (B,) int64 tensor or None.
+            (state_inputs, action_inputs, state_targets, action_targets,
+            batch_agent_ids, reward_targets) where batch_agent_ids is a (B,)
+            int64 tensor or None, and reward_targets is a (B, T, 1) float tensor
+            aligned with action_targets (reward on the predicted transition).
         """
 
         # Get from the buffer in the typical format
         # State size: (B, T, C, H, W)
         # Action size: (B, T, 1)
-        states, actions, next_actions, next_states, _, _, batch_agent_ids = (
-            self.memory.sample_transformer(self.batch_size)
-        )
+        (
+            states,
+            actions,
+            next_actions,
+            next_states,
+            _,
+            _,
+            batch_agent_ids,
+            next_rewards,
+        ) = self.memory.sample_transformer(self.batch_size)
 
         next_actions = np.array(next_actions, dtype=np.int64)  # cast them back
 
@@ -688,12 +725,20 @@ class VisionTransformer(nn.Module):
                 self.device
             )
 
+        # Reward targets aligned with action_targets: (B, T, 1)
+        reward_targets = (
+            torch.tensor(np.array(next_rewards, dtype=np.float32))
+            .to(self.device)
+            .view(self.batch_size, self.num_frames, 1)
+        )
+
         return (
             state_inputs,
             action_inputs,
             state_targets,
             action_targets,
             agent_ids_tensor,
+            reward_targets,
         )
 
     def random_mask(self, state_targets) -> torch.Tensor:
@@ -739,6 +784,33 @@ class VisionTransformer(nn.Module):
 
         return mask
 
+    def region_mask(
+        self, state_targets, region: str = "right"
+    ) -> torch.Tensor:
+        """Spatial region mask: hide a contiguous block of the FOV across all
+        channels and timesteps (True = visible, False = hidden).
+
+        Used by the Phase 3 goal-swap diagnostic: the hidden region is where the
+        model must express its inferred belief about the world. ``region`` is one
+        of "left"/"right"/"top"/"bottom" (the corresponding half of the H x W
+        patch is hidden).
+        """
+        B, T, C, H, W = state_targets.shape
+        mask = torch.ones_like(state_targets, dtype=torch.bool)
+        if region == "left":
+            mask[:, :, :, :, : W // 2] = False
+        elif region == "right":
+            mask[:, :, :, :, W - W // 2 :] = False
+        elif region == "top":
+            mask[:, :, :, : H // 2, :] = False
+        elif region == "bottom":
+            mask[:, :, :, H - H // 2 :, :] = False
+        else:
+            raise ValueError(
+                f"Unknown region: {region!r}. Expected left/right/top/bottom."
+            )
+        return mask
+
     def train_model(self, mask_type: str = "full") -> tuple:
         """Training loop for the transformer model.
 
@@ -751,9 +823,14 @@ class VisionTransformer(nn.Module):
             (state_loss, action_loss) as Python floats.
         """
 
-        state_inputs, action_inputs, state_targets, action_targets, batch_agent_ids = (
-            self.get_batch()
-        )
+        (
+            state_inputs,
+            action_inputs,
+            state_targets,
+            action_targets,
+            batch_agent_ids,
+            _,
+        ) = self.get_batch()
 
         state_inputs = state_inputs.to(self.device)
         action_inputs = action_inputs.to(self.device)
@@ -800,9 +877,14 @@ class VisionTransformer(nn.Module):
         Returns:
             (state_loss, action_loss) as Python floats.
         """
-        state_inputs, action_inputs, state_targets, action_targets, batch_agent_ids = (
-            self.get_batch()
-        )
+        (
+            state_inputs,
+            action_inputs,
+            state_targets,
+            action_targets,
+            batch_agent_ids,
+            _,
+        ) = self.get_batch()
 
         state_inputs = state_inputs.to(self.device)
         action_inputs = action_inputs.to(self.device)
@@ -822,13 +904,131 @@ class VisionTransformer(nn.Module):
             state_inputs = state_inputs * state_mask.float()
 
         with torch.no_grad():
-            x = self._run_transformer(state_inputs, action_inputs, agent_id=effective_agent_id)
+            x = self._run_transformer(
+                state_inputs, action_inputs, agent_id=effective_agent_id
+            )
             B, T = x.size(0), x.size(1)
             state_predictions, action_predictions = self._apply_heads(x, B, T)
             state_loss = self.state_loss(state_predictions, state_targets, mask=None)
             action_loss = self.action_loss(action_predictions, action_targets)
 
         return state_loss.cpu().item(), action_loss.cpu().item()
+
+    def _build_state_mask(
+        self, state_inputs: torch.Tensor, mask_type: str
+    ) -> torch.Tensor | None:
+        """Resolve a mask_type string to a boolean visibility mask (or None)."""
+        if mask_type == "full":
+            return None
+        if mask_type == "random":
+            return self.random_mask(state_inputs)
+        if mask_type in ("gem", "bone", "food", "wall"):
+            return self.channel_mask(state_inputs, mask_type)
+        raise ValueError(
+            f"Unknown mask_type: {mask_type!r}. Expected 'full', 'random', "
+            "'gem', 'bone', 'food', or 'wall'."
+        )
+
+    def reward_loss(
+        self, reward_predictions: torch.Tensor, reward_targets: torch.Tensor
+    ) -> torch.Tensor:
+        """MSE between predicted and true per-step reward.
+
+        Both tensors are (B, T, 1).
+        """
+        return nn.functional.mse_loss(reward_predictions, reward_targets.float())
+
+    def train_self_model(self, mask_type: str = "full") -> tuple:
+        """Train the self/world-model objective: predict next state + next action
+        + reward of the next transition.
+
+        Identical to `train_model` but additionally trains the reward head
+        (weighted by `reward_loss_weight`). Dispatches to the subclass's
+        `state_loss`/`_apply_heads` via `self`, so `ViTOneHot` gets its
+        per-channel cross-entropy state loss automatically.
+
+        Returns:
+            (state_loss, action_loss, reward_loss) as Python floats.
+        """
+        (
+            state_inputs,
+            action_inputs,
+            state_targets,
+            action_targets,
+            batch_agent_ids,
+            reward_targets,
+        ) = self.get_batch()
+        state_inputs = state_inputs.to(self.device)
+        action_inputs = action_inputs.to(self.device)
+
+        state_mask = self._build_state_mask(state_inputs, mask_type)
+        if state_mask is not None:
+            state_inputs = state_inputs * state_mask.float()
+
+        x = self._run_transformer(state_inputs, action_inputs, agent_id=batch_agent_ids)
+        B, T = x.size(0), x.size(1)
+        state_predictions, action_predictions = self._apply_heads(x, B, T)
+        reward_predictions = self.reward_head(x)
+
+        state_loss = self.state_loss(state_predictions, state_targets, mask=None)
+        action_loss = self.action_loss(action_predictions, action_targets)
+        reward_loss = self.reward_loss(reward_predictions, reward_targets)
+        loss = (
+            state_loss
+            + self.action_loss_weight * action_loss
+            + self.reward_loss_weight * reward_loss
+        )
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return (
+            state_loss.detach().cpu().item(),
+            action_loss.detach().cpu().item(),
+            reward_loss.detach().cpu().item(),
+        )
+
+    def evaluate_self_model(
+        self, mask_type: str = "full", agent_id: int | None = None
+    ) -> tuple:
+        """Evaluate the self/world-model objective without a weight update.
+
+        Returns:
+            (state_loss, action_loss, reward_loss) as Python floats.
+        """
+        (
+            state_inputs,
+            action_inputs,
+            state_targets,
+            action_targets,
+            batch_agent_ids,
+            reward_targets,
+        ) = self.get_batch()
+        state_inputs = state_inputs.to(self.device)
+        action_inputs = action_inputs.to(self.device)
+        effective_agent_id = agent_id if agent_id is not None else batch_agent_ids
+
+        state_mask = self._build_state_mask(state_inputs, mask_type)
+        if state_mask is not None:
+            state_inputs = state_inputs * state_mask.float()
+
+        with torch.no_grad():
+            x = self._run_transformer(
+                state_inputs, action_inputs, agent_id=effective_agent_id
+            )
+            B, T = x.size(0), x.size(1)
+            state_predictions, action_predictions = self._apply_heads(x, B, T)
+            reward_predictions = self.reward_head(x)
+            state_loss = self.state_loss(state_predictions, state_targets, mask=None)
+            action_loss = self.action_loss(action_predictions, action_targets)
+            reward_loss = self.reward_loss(reward_predictions, reward_targets)
+
+        return (
+            state_loss.cpu().item(),
+            action_loss.cpu().item(),
+            reward_loss.cpu().item(),
+        )
 
     def state_loss_per_channel(
         self,
@@ -855,7 +1055,9 @@ class VisionTransformer(nn.Module):
             A tuple of state predictions and state targets.
         """
 
-        state_inputs, action_inputs, state_targets, action_targets, _ = self.get_batch()
+        state_inputs, action_inputs, state_targets, action_targets, _, _ = (
+            self.get_batch()
+        )
 
         # Get just the first item in the batch
         state_inputs = state_inputs[0]
@@ -915,6 +1117,7 @@ class ViTOneHot(VisionTransformer):
         weight_decay: float = 0.0,
         label_smoothing: float = 0.0,
         action_loss_weight: float = 1.0,
+        reward_loss_weight: float = 0.0,
     ):
         super().__init__(
             state_size=state_size,
@@ -933,6 +1136,7 @@ class ViTOneHot(VisionTransformer):
             dropout=dropout,
             label_smoothing=label_smoothing,
             action_loss_weight=action_loss_weight,
+            reward_loss_weight=reward_loss_weight,
         )
 
         # Alternate output: for each channel, output a positive and negative classification weight.
@@ -980,9 +1184,14 @@ class ViTOneHot(VisionTransformer):
         Returns:
             (state_loss, action_loss) as Python floats.
         """
-        state_inputs, action_inputs, state_targets, action_targets, batch_agent_ids = (
-            self.get_batch()
-        )
+        (
+            state_inputs,
+            action_inputs,
+            state_targets,
+            action_targets,
+            batch_agent_ids,
+            _,
+        ) = self.get_batch()
         state_inputs = state_inputs.to(self.device)
         action_inputs = action_inputs.to(self.device)
 
@@ -1018,7 +1227,9 @@ class ViTOneHot(VisionTransformer):
             action_loss.detach().cpu().item(),
         )
 
-    def evaluate_model(self, mask_type: str = "full", agent_id: int | None = None) -> tuple:
+    def evaluate_model(
+        self, mask_type: str = "full", agent_id: int | None = None
+    ) -> tuple:
         """Evaluate without updating weights.
 
         ToM objective: mask is applied to the input observations; state loss is
@@ -1027,9 +1238,14 @@ class ViTOneHot(VisionTransformer):
         Returns:
             (state_loss, action_loss) as Python floats.
         """
-        state_inputs, action_inputs, state_targets, action_targets, batch_agent_ids = (
-            self.get_batch()
-        )
+        (
+            state_inputs,
+            action_inputs,
+            state_targets,
+            action_targets,
+            batch_agent_ids,
+            _,
+        ) = self.get_batch()
         state_inputs = state_inputs.to(self.device)
         action_inputs = action_inputs.to(self.device)
 
@@ -1173,7 +1389,9 @@ class ViTOneHot(VisionTransformer):
             A tuple of state predictions and state targets.
         """
 
-        state_inputs, action_inputs, state_targets, action_targets, _ = self.get_batch()
+        state_inputs, action_inputs, state_targets, action_targets, _, _ = (
+            self.get_batch()
+        )
 
         # Get just the first item in the batch
         state_inputs = state_inputs[0]
@@ -1200,3 +1418,218 @@ class ViTOneHot(VisionTransformer):
         )
 
         return state_predictions, state_targets
+
+
+# -------------------------------------------------- #
+# region: Theory-of-Mind belief module (Phase 2)     #
+# -------------------------------------------------- #
+
+
+class BeliefEncoder(nn.Module):
+    """Feudal belief module: encodes another agent's (obs, action) trajectory
+    into a single latent goal/belief embedding ``g``.
+
+    This is the "infer the other agent's desire from behavior" component. Its
+    output is injected into a *frozen* self/world-model (via the
+    ``belief_embedding`` argument of ``VisionTransformer._run_transformer``) to
+    modulate that model's predictions toward the inferred agent. The embedding is
+    a single vector per sample (mean-pooled over time) — a deliberate bottleneck
+    so ``g`` carries a compact goal summary rather than a per-step copy of the
+    input.
+    """
+
+    def __init__(
+        self,
+        state_size: Sequence[int],
+        action_space: int,
+        layer_size: int,
+        patch_size: int,
+        num_frames: int,
+        num_heads: int,
+        num_layers: int,
+        device: str | torch.device,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.device = device
+        self.num_patches = 1
+        for i in (1, 2):
+            self.num_patches *= state_size[i] // patch_size
+
+        self.token_embedding = JointEmbedding(
+            state_size=state_size,
+            patch_size=patch_size,
+            action_space=action_space,
+            layer_size=layer_size,
+            max_timesteps=num_frames,
+        ).to(device)
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    layer_size, num_heads, self.num_patches, dropout=dropout
+                )
+                for _ in range(num_layers)
+            ]
+        ).to(device)
+        self.layernorm = nn.LayerNorm(layer_size).to(device)
+        # Bottleneck MLP producing the goal embedding from the pooled summary.
+        self.to_goal = nn.Sequential(
+            nn.Linear(layer_size, layer_size),
+            nn.GELU(),
+            nn.Linear(layer_size, layer_size),
+        ).to(device)
+
+    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Return goal embedding ``g`` of shape (B, layer_size)."""
+        local_tokens, global_tokens, temporal_embedding = self.token_embedding(
+            states, actions
+        )
+        for block in self.blocks:
+            local_tokens, _, global_tokens, _ = block(
+                local_tokens, global_tokens, temporal_embedding
+            )
+        # Mean-pool the normalized global tokens over time -> (B, D), then MLP.
+        pooled = self.layernorm(global_tokens).mean(dim=1)
+        return self.to_goal(pooled)
+
+
+class BeliefModel(nn.Module):
+    """Phase 2 wrapper: a FROZEN self/world-model conditioned by a trainable
+    ``BeliefEncoder``.
+
+    Given another agent's (masked) trajectory, the belief encoder infers a goal
+    embedding ``g``; the frozen base then predicts that agent's full observation
+    and next action *modulated* by ``g``. Only the belief encoder's parameters
+    train — the base stays fixed, so any successful cross-agent prediction must
+    flow through the explicit inferred goal (the Theory-of-Mind claim).
+    """
+
+    def __init__(
+        self,
+        self_model: VisionTransformer,
+        layer_size: int,
+        patch_size: int,
+        num_heads: int,
+        num_layers: int,
+        device: str | torch.device,
+        LR: float = 1e-3,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.self_model = self_model
+        self.device = device
+        # Freeze the base self/world-model.
+        self.self_model.eval()
+        for p in self.self_model.parameters():
+            p.requires_grad_(False)
+
+        self.belief_encoder = BeliefEncoder(
+            state_size=self_model.state_size,
+            action_space=self_model.action_space,
+            layer_size=layer_size,
+            patch_size=patch_size,
+            num_frames=self_model.num_frames,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            device=device,
+            dropout=dropout,
+        )
+        self.optimizer = optim.Adam(self.belief_encoder.parameters(), lr=LR)
+
+    def _masked_inputs(self, state_inputs: torch.Tensor, mask_type: str):
+        state_mask = self.self_model._build_state_mask(state_inputs, mask_type)
+        if state_mask is not None:
+            return state_inputs * state_mask.float()
+        return state_inputs
+
+    def _losses(self, mask_type: str, use_belief: bool, decouple: bool = False):
+        """Shared forward + loss computation. Returns (state_loss, action_loss)
+        as tensors.
+
+        Args:
+            use_belief: When False, the frozen base runs with no belief
+                conditioning (the no-belief baseline).
+            decouple: Leakage control. When True, the goal embedding ``g`` is
+                encoded from an INDEPENDENT batch (a second draw from
+                ``self_model.memory``) rather than the batch being predicted. If
+                the memory holds a single agent's data, the context and query are
+                the same agent but non-overlapping windows, so ``g`` cannot peek
+                at the prediction target — it must summarize the agent's goal.
+        """
+        (
+            state_inputs,
+            action_inputs,
+            state_targets,
+            action_targets,
+            _agent_ids,
+            _rewards,
+        ) = self.self_model.get_batch()
+        state_inputs = state_inputs.to(self.device)
+        action_inputs = action_inputs.to(self.device)
+
+        masked_inputs = self._masked_inputs(state_inputs, mask_type)
+
+        belief = None
+        if use_belief:
+            if decouple:
+                # Independent context draw for the belief encoder.
+                c_states, c_actions, _, _, _, _ = self.self_model.get_batch()
+                c_states = self._masked_inputs(c_states.to(self.device), mask_type)
+                c_actions = c_actions.to(self.device)
+                belief = self.belief_encoder(c_states, c_actions)
+            else:
+                belief = self.belief_encoder(masked_inputs, action_inputs)
+
+        state_preds, action_preds = self.self_model.forward(
+            masked_inputs, action_inputs, belief_embedding=belief
+        )
+        state_loss = self.self_model.state_loss(state_preds, state_targets, mask=None)
+        action_loss = self.self_model.action_loss(action_preds, action_targets)
+        return state_loss, action_loss
+
+    def train_belief(self, mask_type: str = "full", decouple: bool = False) -> tuple:
+        """One training step for the belief encoder (base frozen).
+
+        Returns (state_loss, action_loss) as floats.
+        """
+        state_loss, action_loss = self._losses(
+            mask_type, use_belief=True, decouple=decouple
+        )
+        loss = state_loss + self.self_model.action_loss_weight * action_loss
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return state_loss.detach().cpu().item(), action_loss.detach().cpu().item()
+
+    def evaluate_belief(
+        self, mask_type: str = "full", use_belief: bool = True, decouple: bool = False
+    ) -> tuple:
+        """Evaluate without a weight update. Set use_belief=False for the
+        no-belief-module baseline (frozen base alone).
+
+        Returns (state_loss, action_loss) as floats.
+        """
+        with torch.no_grad():
+            state_loss, action_loss = self._losses(
+                mask_type, use_belief=use_belief, decouple=decouple
+            )
+        return state_loss.cpu().item(), action_loss.cpu().item()
+
+    def save(self, file_path: str | os.PathLike) -> None:
+        torch.save(
+            {
+                "belief_encoder": self.belief_encoder.state_dict(),
+                "optim": self.optimizer.state_dict(),
+            },
+            file_path,
+        )
+
+    def load(self, file_path: str | os.PathLike) -> None:
+        checkpoint = torch.load(file_path)
+        self.belief_encoder.load_state_dict(checkpoint["belief_encoder"])
+        self.optimizer.load_state_dict(checkpoint["optim"])
+
+
+# -------------------------------------------------- #
+# endregion                                          #
+# -------------------------------------------------- #

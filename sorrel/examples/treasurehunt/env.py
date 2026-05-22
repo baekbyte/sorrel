@@ -37,8 +37,15 @@ class TreasurehuntEnv(Environment[TreasurehuntWorld]):
         Reads agent count from config.model.num_agents (default 2).
         """
         agent_num = int(self.config.model.get("num_agents", 2))
+        # Optional per-agent reward preferences. config.model.preferences, when set,
+        # is a list of {entity_kind: multiplier} dicts, one per agent. Agents without
+        # an entry (or when unset) fall back to uniform reward.
+        preferences_list = self.config.model.get("preferences", None)
         agents = []
-        for _ in range(agent_num):
+        for agent_idx in range(agent_num):
+            preferences = None
+            if preferences_list is not None and agent_idx < len(preferences_list):
+                preferences = dict(preferences_list[agent_idx])
             # create the observation spec
             entity_list = [
                 "EmptyEntity",
@@ -106,6 +113,7 @@ class TreasurehuntEnv(Environment[TreasurehuntWorld]):
                     observation_spec=observation_spec,
                     action_spec=action_spec,
                     model=model,
+                    preferences=preferences,
                 )
             )
 

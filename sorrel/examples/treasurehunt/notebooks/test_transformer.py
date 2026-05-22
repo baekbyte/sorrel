@@ -342,7 +342,7 @@ for mask_type in EVAL_MASK_TYPES:
 
     # Per-channel state loss under this mask condition
     per_channel: dict[int, float] = {}
-    state_inputs, action_inputs, state_targets_batch, _, _ = model.get_batch()
+    state_inputs, action_inputs, state_targets_batch, _, _, _ = model.get_batch()
     state_inputs = state_inputs.to(model.device)
     action_inputs = action_inputs.to(model.device)
 

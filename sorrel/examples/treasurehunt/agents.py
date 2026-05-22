@@ -15,9 +15,16 @@ from sorrel.examples.treasurehunt.world import TreasurehuntWorld
 class TreasurehuntAgent(MovingAgent[TreasurehuntWorld]):
     """A treasurehunt agent that uses the iqn model."""
 
-    def __init__(self, observation_spec, action_spec, model):
+    def __init__(self, observation_spec, action_spec, model, preferences=None):
         super().__init__(observation_spec, action_spec, model)
         self.sprite = Path(__file__).parent / "./assets/hero.png"
+        # Per-agent reward preferences over entity kinds. Maps an entity's `kind`
+        # (its class name, e.g. "Gem"/"Food"/"Bone") to a multiplier applied to
+        # that entity's value when this agent collects it. A missing kind defaults
+        # to 1.0, so an empty/None preference reproduces the original uniform reward.
+        # Heterogeneous preferences are what make an agent's goal inferable from
+        # behavior (the Theory of Mind signal).
+        self.preferences: dict[str, float] = preferences or {}
 
     # end constructor
 
@@ -56,9 +63,10 @@ class TreasurehuntAgent(MovingAgent[TreasurehuntWorld]):
         if action_name == "right":
             new_location = (self.location[0], self.location[1] + 1, self.location[2])
 
-        # get reward obtained from object at new_location
+        # get reward obtained from object at new_location, scaled by this agent's
+        # preference for that entity kind (default 1.0 = original behavior).
         target_object = world.observe(new_location)
-        reward = target_object.value
+        reward = self.preferences.get(target_object.kind, 1.0) * target_object.value
 
         # try moving to new_location
         world.move(self, new_location)

@@ -115,18 +115,6 @@ class IQN(nn.Module):
         Returns:
             tuple: quantiles, torch.Tensor (size: (batch_size, n_tau, action_space)); taus, torch.Tensor (size) ((batch_size, n_tau, 1))
         """
-        # REMOVED: as suggested by Claude and GPT, input is not an image, so no need to add noise or normalize
-        # Add noise to the input
-        # eps = 0.01
-        # noise = torch.rand_like(input) * eps
-        # input = input / 255.0
-        # input = input + noise
-
-        # Flatten the input from [1, N, 7, 9, 9] to [1, N * 7 * 9 * 9]
-        # batch_size, timesteps, C, H, W = input.size()
-        # c_out = input.view(batch_size * timesteps, C, H, W)
-        # r_in = c_out.view(batch_size, -1)
-
         batch_size = input.size()[0]
         r_in = input.view(batch_size, -1)
 

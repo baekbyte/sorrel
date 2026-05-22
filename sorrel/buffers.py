@@ -318,8 +318,10 @@ class TransformerBuffer(Buffer):
             batch_size (int): The number of experiences to sample.
 
         Returns:
-            Tuple of (states, actions, next_actions, next_states, dones, valid, batch_agent_ids).
-            batch_agent_ids is None if agent_ids are not stored.
+            Tuple of (states, actions, next_actions, next_states, dones, valid,
+            batch_agent_ids, next_rewards). batch_agent_ids is None if agent_ids
+            are not stored. next_rewards is the reward received on the predicted
+            transition (aligned with next_actions / next_states).
         """
         indices = np.random.choice(
             max(1, self.size - self.n_frames - 1), batch_size, replace=False
@@ -331,6 +333,7 @@ class TransformerBuffer(Buffer):
         next_states = self.states[indices + 1].reshape(batch_size, -1)
         actions = self.actions[indices].reshape(batch_size, -1)
         next_actions = self.actions[indices + 1].reshape(batch_size, -1)
+        next_rewards = self.rewards[indices + 1].reshape(batch_size, -1)
         dones = self.dones[indices[:, -1]].reshape(batch_size, -1)
         valid = (1.0 - np.any(self.dones[indices[:, :-1]], axis=-1)).reshape(
             batch_size, -1
@@ -346,7 +349,16 @@ class TransformerBuffer(Buffer):
             if self.extra_data["agent_ids"] is not None:
                 batch_agent_ids = self.extra_data["agent_ids"][indices[:, 0]]
 
-        return states, actions, next_actions, next_states, dones, valid, batch_agent_ids
+        return (
+            states,
+            actions,
+            next_actions,
+            next_states,
+            dones,
+            valid,
+            batch_agent_ids,
+            next_rewards,
+        )
 
 
 class SavedGames(Buffer):
