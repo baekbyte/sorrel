@@ -72,14 +72,26 @@ class EmptyEntity(Entity[TreasurehuntWorld]):
         if (  # NOTE: If the spawn prob is too high, the environment gets overrun
             np.random.random() < world.spawn_prob
         ):
-            entity: Entity = np.random.choice(
-                np.array(
-                    [
-                        Gem(world.values["gem"]),
-                        Food(world.values["food"]),
-                        Bone(world.values["bone"]),
-                    ],
-                    dtype=object,
+            entity: Entity
+            if getattr(world, "segregate", False):
+                # Region-based spawning: bones anywhere (goal-neutral), gems in
+                # the left half, food in the right half. An agent's preference
+                # thus determines which direction it travels.
+                if np.random.random() < world.bone_fraction:
+                    entity = Bone(world.values["bone"])
+                elif self.location[1] < world.width // 2:
+                    entity = Gem(world.values["gem"])
+                else:
+                    entity = Food(world.values["food"])
+            else:
+                entity = np.random.choice(
+                    np.array(
+                        [
+                            Gem(world.values["gem"]),
+                            Food(world.values["food"]),
+                            Bone(world.values["bone"]),
+                        ],
+                        dtype=object,
+                    )
                 )
-            )
             world.add(self.location, entity)

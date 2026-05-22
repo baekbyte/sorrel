@@ -69,6 +69,10 @@ config = {
         "food_value": 10,
         "bone_value": -10,
         "spawn_prob": 0.01,
+        # Spatial segregation: gems spawn on the left half, food on the right,
+        # so each preference produces a distinct direction of travel.
+        "segregate": True,
+        "bone_fraction": 0.2,
     },
 }
 
