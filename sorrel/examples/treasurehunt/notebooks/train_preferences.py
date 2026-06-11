@@ -1,23 +1,8 @@
-"""Phase 0: heterogeneous-preference policies + per-preference memory buffers.
-
+"""
 Trains two agents that share the same world but have **different reward
 functions** (a gem-lover and a food-lover), each with its own IQN policy. Their
 differing preferences make each agent's goal inferable from behavior — the
 signal the later belief-desire-inference phases depend on.
-
-Pipeline:
-  1. Build a TreasurehuntEnv with config.model.preferences = [gem_pref, food_pref].
-     setup_agents() gives each agent a separate PyTorchIQN and its preference.
-  2. run_experiment() co-trains both policies in the shared world.
-  3. Save each agent's IQN checkpoint.
-  4. generate_memories() rolls out the trained policies -> memories/agent0.npz
-     (gem-lover) and memories/agent1.npz (food-lover). We copy these to
-     memories/gemlover.npz and memories/foodlover.npz for clarity.
-  5. Print per-agent action-distribution + reward diagnostics to confirm the two
-     policies behave differently.
-
-Usage:
-    python -m sorrel.examples.treasurehunt.notebooks.train_preferences
 """
 
 import shutil
