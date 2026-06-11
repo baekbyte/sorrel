@@ -1,17 +1,9 @@
-"""Phase 1: train the observer's frozen self/world-model.
-
+"""
 Trains a ViTOneHot on the OBSERVER's own experience (the gem-lover buffer) under
 the self/world-model objective: given (state, action) predict
   - the next state (per-channel cross-entropy reconstruction),
   - the next action (cross-entropy),
   - the reward of the next transition (MSE, via the new reward head).
-
-This is the "I act and obtain rewards / predict my own next state" model from
-the plan. Its weights are saved and later FROZEN; the Phase 2 feudal belief
-module modulates it to predict OTHER agents' behavior from their inferred goals.
-
-Usage:
-    python -m sorrel.examples.treasurehunt.notebooks.train_self_model
 """
 
 from datetime import datetime
@@ -64,7 +56,7 @@ buffer = TransformerBuffer.load(OBSERVER_BUFFER)
 print(f"Loaded observer buffer: size={buffer.size}")
 
 model = ViTOneHot(
-    state_size=(6, 9, 9),
+    state_size=(6, 15, 15),
     action_space=4,
     layer_size=192,
     patch_size=3,
