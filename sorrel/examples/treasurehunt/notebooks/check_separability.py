@@ -26,7 +26,7 @@ FOOD = DATA_DIR / "memories/foodlover.npz"
 N = 1500
 
 ARCH = dict(
-    state_size=(6, 9, 9),
+    state_size=(6, 15, 15),
     action_space=4,
     layer_size=192,
     patch_size=3,
