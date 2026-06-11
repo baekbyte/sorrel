@@ -56,7 +56,7 @@ config = {
         "log_dir": DATA_DIR / "logs/preferences" / STATIC_RUNTIME,
     },
     "model": {
-        "agent_vision_radius": 4,
+        "agent_vision_radius": 7,  # 15x15 obs (was 4 = 9x9). Inner 9x9 = real FOV
         "epsilon_decay": 0.0005,
         "num_agents": 2,
         "preferences": [GEM_PREF, FOOD_PREF],
@@ -69,9 +69,12 @@ config = {
         "food_value": 10,
         "bone_value": -10,
         "spawn_prob": 0.01,
-        # Spatial segregation: gems spawn on the left half, food on the right,
-        # so each preference produces a distinct direction of travel.
-        "segregate": True,
+        # Non-segregated: gems and food spawn uniformly everywhere. The base
+        # therefore has NO spatial prior about where each entity lives, so the
+        # observer can only know "gems are over there" by watching the gem-lover.
+        # This stresses the belief module -- behavior should diverge with vs
+        # without belief.
+        "segregate": False,
         "bone_fraction": 0.2,
     },
 }
