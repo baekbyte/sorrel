@@ -57,6 +57,26 @@ class Bone(Gem):
         self.sprite = Path(__file__).parent / "./assets/bone.png"
 
 
+class Coin(Gem):
+    """A third positive item kind (ToM v3 K-preference worlds).
+
+    Reuses the gem sprite; sprites only affect GIF rendering, not one-hot
+    observations, where Coin has its own channel.
+    """
+
+    def __init__(self, value):
+        super().__init__(value)
+        self.sprite = Path(__file__).parent / "./assets/gem.png"
+
+
+class Berry(Gem):
+    """A fourth positive item kind (ToM v3 K-preference worlds)."""
+
+    def __init__(self, value):
+        super().__init__(value)
+        self.sprite = Path(__file__).parent / "./assets/food.png"
+
+
 class EmptyEntity(Entity[TreasurehuntWorld]):
     """An entity that represents an empty space in the treasurehunt environment."""
 

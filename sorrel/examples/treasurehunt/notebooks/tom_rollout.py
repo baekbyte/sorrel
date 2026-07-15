@@ -73,8 +73,20 @@ FOOD_PREF = {"Gem": 0.2, "Food": 1.0, "Bone": 1.0}
 # (no separate OUT_GIF -- ImageRenderer.save_gif writes to DATA_DIR/gifs/)
 
 # Frozen-base architecture (must match training)
+#
+# Channels:
+#   0  EmptyEntity     (all-zero entity vector — same as a masked cell, so we
+#                       added a dedicated mask channel below to distinguish)
+#   1  Wall
+#   2  Gem
+#   3  Bone
+#   4  Food
+#   5  TreasurehuntAgent
+#   6  Mask            (NEW): 1 where the observer cannot actually see the cell
+#                       (outer ring beyond inner 9x9 FOV), 0 elsewhere.
+# Entity channels 0..5 are zeroed wherever mask channel == 1.
 ARCH = dict(
-    state_size=(6, 15, 15),  # observer's model input -- inner 9x9 visible, outer ring masked
+    state_size=(7, 15, 15),  # 6 entity channels + 1 mask channel
     action_space=4,
     layer_size=192,
     patch_size=3,
@@ -83,10 +95,58 @@ ARCH = dict(
     batch_size=1,
     num_layers=2,
 )
-ACTUAL_FOV_RADIUS = 4  # observer's real perception radius (9x9 inner of the 15x15 input)
+NUM_ENTITY_CHANNELS = 6      # underlying obs_spec channels (gem/food/etc buffers stay 6-ch)
+MASK_CHANNEL = 6             # index of the dedicated mask channel
+ACTUAL_FOV_RADIUS = 4        # observer's real perception radius (9x9 inner of the 15x15 input)
 ENTITY_LIST = ["EmptyEntity", "Wall", "Gem", "Bone", "Food", "TreasurehuntAgent"]
 ACTION_NAMES = ["up", "down", "left", "right"]
 GEM_CH, FOOD_CH, AGENT_CH = 2, 4, 5
+
+# Precomputed outer-ring 2D mask (1 in outer ring, 0 inside inner FOV).
+def _outer_ring_2d_np(H: int, W: int, radius: int = ACTUAL_FOV_RADIUS) -> np.ndarray:
+    """1 in outer ring (chebyshev > radius from center), 0 inside."""
+    cy, cx = H // 2, W // 2
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    return (np.maximum(np.abs(yy - cy), np.abs(xx - cx)) > radius).astype(np.float32)
+
+
+_H, _W = ARCH["state_size"][1], ARCH["state_size"][2]
+OUTER_RING_2D_NP = _outer_ring_2d_np(_H, _W, ACTUAL_FOV_RADIUS)         # (H, W) numpy
+OUTER_RING_2D = torch.from_numpy(OUTER_RING_2D_NP)                       # (H, W) torch
+
+
+def add_mask_channel(states_6ch: torch.Tensor, mask_2d: torch.Tensor) -> torch.Tensor:
+    """Zero out entity channels under mask_2d and append mask_2d as channel 6.
+
+    Args:
+        states_6ch: (..., 6, H, W) — entity channels only.
+        mask_2d:    (H, W) — 1 where masked, 0 elsewhere.
+
+    Returns:
+        (..., 7, H, W) with entity channels zeroed inside the mask and channel
+        6 set to mask_2d everywhere.
+    """
+    H, W = mask_2d.shape
+    leading = states_6ch.shape[:-3]
+    # Broadcastable mask: (1, ..., 1, 1, H, W)
+    mask_b = mask_2d.view(*([1] * (states_6ch.dim() - 2)), H, W)
+    masked = states_6ch * (1.0 - mask_b)
+    # Mask channel with same leading dims as states_6ch but 1 channel
+    mask_channel = mask_b.expand(*leading, 1, H, W).to(states_6ch.dtype)
+    return torch.cat([masked, mask_channel], dim=-3)
+
+
+def add_zero_mask_channel(states_6ch: torch.Tensor) -> torch.Tensor:
+    """Append a zero-valued mask channel to a 6-channel state (nothing masked).
+
+    Used for the belief encoder's input: the watched agent has no masked
+    region, so its mask channel is all zeros. This keeps encoder and base
+    operating on consistent 7-channel inputs.
+    """
+    leading = states_6ch.shape[:-3]
+    H, W = states_6ch.shape[-2], states_6ch.shape[-1]
+    zero_ch = torch.zeros(*leading, 1, H, W, dtype=states_6ch.dtype, device=states_6ch.device)
+    return torch.cat([states_6ch, zero_ch], dim=-3)
 
 def _make_config(watched_config: str):
     """Build the env config for a given watched-agent configuration."""
@@ -180,6 +240,20 @@ class ObserverAgent(MovingAgent[TreasurehuntWorld]):
     maintains a FOV-gated 5-frame window of each one's first-person POV +
     action."""
 
+    # Observer operating modes:
+    #   "belief"       - encoded g modulates pass-1 reconstruction (current belief_on=True)
+    #   "imagine"      - no g; base's unconditional reconstruction still fills the
+    #                    outer ring (this is what belief_on=False actually did)
+    #   "masked"       - no substitution at all; pass 2 acts on the outer-ring-masked
+    #                    view (mask channel = 1) — the true "no belief" baseline,
+    #                    in-distribution for the Phase-1 base
+    #   "oracle_world" - pov() is NOT masked; the observer sees the true outer ring.
+    #                    Ceiling on how much any belief could ever help.
+    #   "oracle_g"     - like "belief" but injects a precomputed class-prototype g
+    #                    (ground-truth preference) instead of the online-encoded g.
+    #                    Isolates decode-path quality from inference-path quality.
+    MODES = ("belief", "imagine", "masked", "oracle_world", "oracle_g")
+
     def __init__(
         self,
         observation_spec: OneHotObservationSpec,
@@ -188,8 +262,16 @@ class ObserverAgent(MovingAgent[TreasurehuntWorld]):
         belief_encoder: BeliefEncoder,
         watched_agents: list[TreasurehuntAgent],
         belief_on: bool = True,
+        mode: str | None = None,
+        g_override: dict[str, torch.Tensor] | None = None,
     ):
         super().__init__(observation_spec, action_spec, _ObserverModelStub(self_model, belief_encoder))
+        self.mode = mode if mode is not None else ("belief" if belief_on else "imagine")
+        if self.mode not in self.MODES:
+            raise ValueError(f"Unknown observer mode: {self.mode!r}")
+        if self.mode == "oracle_g" and not g_override:
+            raise ValueError("mode='oracle_g' requires g_override={'gemlover': g, 'foodlover': g}")
+        self.g_override = g_override or {}
         # Appear as a TreasurehuntAgent in the observation spec's entity_map so
         # the observer is rendered into observations with the agent one-hot.
         self.kind = "TreasurehuntAgent"
@@ -200,7 +282,8 @@ class ObserverAgent(MovingAgent[TreasurehuntWorld]):
         self.preferences: dict[str, float] = {"Gem": 1.0, "Food": 0.2, "Bone": 1.0}
         self.self_model = self_model
         self.belief_encoder = belief_encoder
-        self.belief_on = belief_on
+        # g is only gathered in the two g-driven modes.
+        self.belief_on = self.mode in ("belief", "oracle_g")
         self.watched_agents = watched_agents
         # Per-watched-agent rolling windows of (pov, action) -- ONLY frames
         # when that agent was inside the observer's FOV.
@@ -221,27 +304,21 @@ class ObserverAgent(MovingAgent[TreasurehuntWorld]):
 
     # --- pov / FOV utilities --------------------------------------------------
 
-    def _apply_outer_ring_mask(self, obs: np.ndarray) -> np.ndarray:
-        """Zero out cells beyond the observer's actual FOV.
-
-        The model input is 15x15 but the observer's real perception is the
-        inner 9x9 (chebyshev distance <= ACTUAL_FOV_RADIUS from center). The
-        outer ring is masked -- belief fills it in.
-        """
-        out = obs.copy()
-        _, H, W = out.shape
-        cy, cx = H // 2, W // 2
-        yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-        visible = (np.maximum(np.abs(yy - cy), np.abs(xx - cx)) <= ACTUAL_FOV_RADIUS).astype(out.dtype)
-        return out * visible[None, :, :]
-
     def pov(self, world: TreasurehuntWorld) -> np.ndarray:
-        # The model's input is 15x15 but only the inner 9x9 is visible to the
-        # observer. The outer ring is masked -- that's the hidden region the
-        # belief module reasons about.
-        full = self.observation_spec.observe(world, self.location)  # (C, 15, 15)
-        masked = self._apply_outer_ring_mask(full)
-        return masked.reshape(1, -1)
+        """7-channel POV: 6 entity channels with outer ring zeroed, plus a 7th
+        mask channel set to 1 in the outer ring (so masked cells are
+        distinguishable from EmptyEntity, which is also all-zero across the
+        entity channels).
+
+        In "oracle_world" mode nothing is masked: the observer sees the true
+        outer ring (mask channel = 0 everywhere). This is the information
+        ceiling for any belief mechanism.
+        """
+        full_6ch = self.observation_spec.observe(world, self.location)  # (6, 15, 15) np
+        full_t = torch.from_numpy(full_6ch.astype(np.float32))           # to torch
+        ring = torch.zeros_like(OUTER_RING_2D) if self.mode == "oracle_world" else OUTER_RING_2D
+        seven = add_mask_channel(full_t, ring)                           # (7, 15, 15)
+        return seven.numpy().reshape(1, -1)
 
     def _in_fov(self, other: TreasurehuntAgent) -> bool:
         """Is `other` inside the observer's ACTUAL FOV (inner 9x9 of the 15x15
@@ -257,18 +334,25 @@ class ObserverAgent(MovingAgent[TreasurehuntWorld]):
         inner FOV, append (watched agent's OWN first-person POV, watched
         agent's action this turn) to that agent's window. The observer can
         only access the agent's perspective WHILE it can see them.
+
+        The watched agent's POV is 6-channel (their full first-person view).
+        We pad it with a zero mask channel here so encoder/base operate on
+        consistent 7-channel inputs.
         """
+        entity_shape = (NUM_ENTITY_CHANNELS, ARCH["state_size"][1], ARCH["state_size"][2])
         for other in self.watched_agents:
             if not self._in_fov(other):
                 continue
             mem = other.model.memory
             if mem.size < 1:
                 continue
-            # Watched agent's most recent (POV, action) lives at memory[idx-1].
             idx = (mem.idx - 1) % mem.capacity
-            pov = mem.states[idx].reshape(ARCH["state_size"])
+            pov_6ch = mem.states[idx].reshape(entity_shape)  # (6, 15, 15)
+            pov_7ch = add_zero_mask_channel(
+                torch.from_numpy(pov_6ch.astype(np.float32))
+            ).numpy()
             act = int(mem.actions[idx])
-            self._windows[id(other)].append((pov.copy(), act))
+            self._windows[id(other)].append((pov_7ch, act))
 
     def _encode_g(self, window: deque) -> torch.Tensor | None:
         """Encode g from a full 5-frame window, or return None if not full."""
@@ -308,63 +392,92 @@ class ObserverAgent(MovingAgent[TreasurehuntWorld]):
         )
 
     def get_action(self, state: np.ndarray) -> int:
-        """Two-pass action selection:
-          Pass 1 (VISION): frozen base + g reconstructs the full 15x15 POV.
-            The argmax of the reconstructed state is substituted into the
-            MASKED outer ring -> belief-completed observation.
-          Pass 2 (ACTION): frozen base runs on the belief-completed POV
-            WITHOUT g. The action head reflects the observer's OWN preference
-            (encoded in the base's gem-lover-trained weights) applied to the
-            belief-inferred world.
+        """Two-pass action selection with PER-AGENT prediction averaging.
+
+        Pass 1 (VISION): for each watched agent with a full window, run the
+          frozen base + that agent's g separately; average the per-channel
+          positive-class probabilities across watched agents; argmax over
+          entity channels -> reconstructed outer ring.
+
+          This is mathematically distinct from "average the g embeddings then
+          run once" -- if g_gem says 'gem in the outer ring' and g_food says
+          'food in the outer ring', averaging the EMBEDDINGS lands in a
+          neither-here-nor-there region of g-space and the reconstruction is
+          ambiguous; averaging the PREDICTIONS produces a 50/50 gem-vs-food
+          posterior, which is the correct belief.
+
+        Pass 2 (ACTION): frozen base runs on the belief-completed POV WITHOUT
+          g, mask channel = 0 -- the base's own preference (gem-lover) drives
+          the action choice.
         """
         s_seq, a_seq = self._self_history(state)
         C, H, W = ARCH["state_size"]
 
-        # Encode g from each watched-agent window (only those with a full
-        # window). When belief_on is False we skip the encoder; pass 1 still
-        # runs but with belief=None.
         gs = []
         self.inferences = {}
         if self.belief_on:
             for other in self.watched_agents:
                 g = self._encode_g(self._windows[id(other)])
                 if g is not None:
-                    gs.append(g)
                     label = (
                         "gemlover"
                         if other.preferences.get("Gem", 0) > 0.5
                         else "foodlover"
                     )
+                    if self.mode == "oracle_g":
+                        # Ground-truth preference: swap in the class prototype.
+                        # Same FOV gating (only when a full window exists), so
+                        # the only difference vs "belief" is g quality.
+                        g = self.g_override[label]
+                    gs.append(g)
                     self.inferences[f"g({label})_norm"] = float(g.norm().item())
-        belief = torch.stack(gs).mean(0) if gs else None  # (1, layer_size) or None
 
         with torch.no_grad():
-            # ---- PASS 1: vision ---------------------------------------------
-            preds, _ = self.self_model.forward(s_seq, a_seq, belief_embedding=belief)
-            # preds: (1, T, 2, H, W, C). Softmax over the neg/pos dim, take
-            # positive prob, then argmax over channels for a hard one-hot
-            # reconstruction.
-            pos = F.softmax(preds, dim=2)[:, :, 1]  # (1, T, H, W, C)
-            ch = pos.argmax(dim=-1)  # (1, T, H, W)
-            recon = F.one_hot(ch, num_classes=C).permute(0, 1, 4, 2, 3).float()
+            if self.mode in ("masked", "oracle_world"):
+                # No pass-1 substitution: act directly on the observed view
+                # (masked view stays masked; oracle view is already complete).
+                _, action_logits = self.self_model.forward(
+                    s_seq, a_seq, belief_embedding=None
+                )
+                probs = F.softmax(action_logits[0, -1], dim=-1)
+                action = int(probs.argmax().item())
+                self.last_action_name = ACTION_NAMES[action]
+                self.last_belief_recon = {
+                    a: float(probs[i].item()) for i, a in enumerate(ACTION_NAMES)
+                }
+                self.last_masked_pov = s_seq[0, -1].cpu().numpy()
+                self.last_completed_pov = s_seq[0, -1].cpu().numpy()
+                self.last_pos_probs = None
+                self.last_belief_was_used = False
+                return action
 
-            # Build a "visible" mask: True (= 1) inside the observer's actual
-            # FOV (inner 9x9 of the 15x15), False (= 0) in the masked outer
-            # ring. Same shape as s_seq: (1, T, C, H, W).
-            cy, cx = H // 2, W // 2
-            yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-            inner = torch.from_numpy(
-                (np.maximum(np.abs(yy - cy), np.abs(xx - cx)) <= ACTUAL_FOV_RADIUS).astype(np.float32)
-            )
+            # ---- PASS 1: vision (per-agent reconstruction, then average) ----
+            if gs:
+                pos_per_agent = []
+                for g in gs:
+                    preds, _ = self.self_model.forward(s_seq, a_seq, belief_embedding=g)
+                    # preds: (1, T, 2, H, W, C=7). Softmax over neg/pos dim ->
+                    # take positive-class probability per channel.
+                    pos_per_agent.append(F.softmax(preds, dim=2)[:, :, 1])
+                pos = torch.stack(pos_per_agent, dim=0).mean(dim=0)  # (1, T, H, W, C)
+            else:
+                # No belief (belief_on=False or no full window): run with belief=None.
+                preds, _ = self.self_model.forward(s_seq, a_seq, belief_embedding=None)
+                pos = F.softmax(preds, dim=2)[:, :, 1]
+
+            # Argmax over entity channels (0..5), not the mask channel.
+            entity_pos = pos[..., :NUM_ENTITY_CHANNELS]       # (1, T, H, W, 6)
+            ch = entity_pos.argmax(dim=-1)                    # (1, T, H, W)
+            recon_6 = F.one_hot(ch, num_classes=NUM_ENTITY_CHANNELS).permute(0, 1, 4, 2, 3).float()
+            recon_mask_ch = torch.zeros(1, ARCH["num_frames"], 1, H, W)
+            recon = torch.cat([recon_6, recon_mask_ch], dim=2)  # (1, T, 7, H, W)
+
+            inner = 1.0 - OUTER_RING_2D                                   # (H, W)
             visible = inner.view(1, 1, 1, H, W).expand(1, ARCH["num_frames"], C, H, W)
-
-            # Belief-completed observation: keep real visible cells, substitute
-            # belief-reconstructed cells in the masked outer ring.
             completed = s_seq * visible + recon * (1 - visible)
+            completed[:, :, MASK_CHANNEL] = 0.0  # belief-completed view is "known"
 
             # ---- PASS 2: action ---------------------------------------------
-            # No belief injected. The base predicts the observer's next action
-            # on the belief-completed world using its own (gem-lover) policy.
             _, action_logits = self.self_model.forward(
                 completed, a_seq, belief_embedding=None
             )
@@ -372,22 +485,17 @@ class ObserverAgent(MovingAgent[TreasurehuntWorld]):
             action = int(probs.argmax().item())
             self.last_action_name = ACTION_NAMES[action]
 
-            # Diagnostics: cache reconstructed-entity prevalence in the outer
-            # ring + action probability distribution.
-            hidden_mask = (1 - inner).bool()  # (H, W)
+            hidden_mask = (1 - inner).bool()
             last_pos = pos[0, -1]  # (H, W, C)
             self.last_belief_recon = {
                 "gem_in_ring": float(last_pos[..., GEM_CH][hidden_mask].mean().item()),
                 "food_in_ring": float(last_pos[..., FOOD_CH][hidden_mask].mean().item()),
                 **{a: float(probs[i].item()) for i, a in enumerate(ACTION_NAMES)},
             }
-
-            # Cache per-step internals for the visualization script. Final
-            # timestep of the sequence is what was just predicted.
-            self.last_masked_pov = s_seq[0, -1].cpu().numpy()         # (C, H, W) -- what the observer actually saw
-            self.last_completed_pov = completed[0, -1].cpu().numpy()  # (C, H, W) -- belief-completed
-            self.last_pos_probs = last_pos.cpu().numpy()              # (H, W, C) per-channel pos prob
-            self.last_belief_was_used = belief is not None
+            self.last_masked_pov = s_seq[0, -1].cpu().numpy()
+            self.last_completed_pov = completed[0, -1].cpu().numpy()
+            self.last_pos_probs = last_pos.cpu().numpy()
+            self.last_belief_was_used = bool(gs)
         return action
 
     # --- standard Agent overrides --------------------------------------------
@@ -475,6 +583,8 @@ def build_env(
     watched_config: str = WATCHED_CONFIG,
     belief_on: bool = BELIEF_ON,
     seed: int | None = None,
+    mode: str | None = None,
+    g_override: dict[str, torch.Tensor] | None = None,
 ) -> tuple["ToMRolloutEnv", "ObserverAgent"]:
     if seed is not None:
         torch.manual_seed(seed)
@@ -522,6 +632,8 @@ def build_env(
         belief_encoder=belief_encoder,
         watched_agents=[],
         belief_on=belief_on,
+        mode=mode,
+        g_override=g_override,
     )
 
     # 4. Deterministic spawn positions. For watched agents, choose positions

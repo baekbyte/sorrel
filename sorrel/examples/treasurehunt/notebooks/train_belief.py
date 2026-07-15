@@ -34,11 +34,15 @@ SEED = 0
 BATCH_SIZE = 64
 LR = 1e-3
 PREF_LOSS_WEIGHT = 1.0       # weight on the preference-classification cross-entropy
-RECON_LOSS_WEIGHT = 1.0      # weight on state-reconstruction under random masking
+RECON_LOSS_WEIGHT = 1.0      # weight on state-reconstruction with mask channel
 NUM_PREFERENCES = 2           # {gem-lover, food-lover}
 
+NUM_ENTITY_CHANNELS = 6      # underlying buffers are 6-channel
+MASK_CHANNEL_IDX = 6         # mask channel index in 7-channel model input
+ACTUAL_FOV_RADIUS = 4
+
 ARCH = dict(
-    state_size=(6, 15, 15),
+    state_size=(7, 15, 15),  # 6 entity + 1 mask channel
     action_space=4,
     layer_size=192,
     patch_size=3,
@@ -48,7 +52,14 @@ ARCH = dict(
     num_layers=2,
 )
 C, H, W = ARCH["state_size"]
-FLAT_OBS = C * H * W
+FLAT_OBS = NUM_ENTITY_CHANNELS * H * W  # buffers are 6-channel; mask channel added at training time
+
+# Precomputed outer-ring mask (H, W) — 1 outside inner FOV, 0 inside.
+_cy, _cx = H // 2, W // 2
+_yy, _xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+OUTER_RING_2D = torch.from_numpy(
+    (np.maximum(np.abs(_yy - _cy), np.abs(_xx - _cx)) > ACTUAL_FOV_RADIUS).astype(np.float32)
+)
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -122,11 +133,34 @@ logger = TensorboardLogger(
 )
 
 
+def _add_mask_channel(states_6: torch.Tensor, mask_2d: torch.Tensor) -> torch.Tensor:
+    """(B, T, 6, H, W) + (H, W) mask -> (B, T, 7, H, W) with entity channels
+    zeroed under the mask and a 7th mask channel set to mask_2d."""
+    B, T, _, H_, W_ = states_6.shape
+    visible = 1.0 - mask_2d
+    masked = states_6 * visible.view(1, 1, 1, H_, W_)
+    mask_ch = mask_2d.view(1, 1, 1, H_, W_).expand(B, T, 1, H_, W_).to(states_6.dtype)
+    return torch.cat([masked, mask_ch], dim=2)
+
+
+def _add_zero_mask_channel(states_6: torch.Tensor) -> torch.Tensor:
+    """Pad with a zero mask channel (nothing masked)."""
+    B, T, _, H_, W_ = states_6.shape
+    zero_ch = torch.zeros(B, T, 1, H_, W_, dtype=states_6.dtype)
+    return torch.cat([states_6, zero_ch], dim=2)
+
+
 def step():
-    """One training step. Alternates which preference's buffer the batch
-    comes from -- but we mix both per step so the gradient sees both
-    preferences. Returns (state_loss, pref_loss, pref_acc) as floats."""
-    # Half batch from each preference. Concatenate, label, shuffle.
+    """One training step. Half batch from each preference, labeled, shuffled.
+
+    The ENCODER reads the watched agent's full 7-channel POV with mask channel = 0
+    (the watched agent has no masked region).
+
+    The BASE reads a 7-channel input where the outer ring is masked (with mask
+    channel = 1 in the outer ring) -- mirroring the observer's deployment-time
+    input distribution. The base's job: reconstruct the FULL next state from
+    the masked input + g.
+    """
     half = BATCH_SIZE // 2
     gem_batch = sample_window(gem_buf, half, ARCH["num_frames"])
     food_batch = sample_window(food_buf, half, ARCH["num_frames"])
@@ -134,29 +168,32 @@ def step():
     actions = np.concatenate([gem_batch["actions"], food_batch["actions"]], axis=0)
     next_states = np.concatenate([gem_batch["next_states"], food_batch["next_states"]], axis=0)
     labels = np.concatenate([np.zeros(half, dtype=np.int64), np.ones(half, dtype=np.int64)])
-    # Shuffle so the batch is mixed.
     perm = np.random.permutation(BATCH_SIZE)
     states, actions, next_states, labels = states[perm], actions[perm], next_states[perm], labels[perm]
 
-    s = torch.tensor(states, dtype=torch.float32).view(BATCH_SIZE, ARCH["num_frames"], C, H, W)
+    # 6-channel raw windows
+    s_6 = torch.tensor(states, dtype=torch.float32).view(
+        BATCH_SIZE, ARCH["num_frames"], NUM_ENTITY_CHANNELS, H, W
+    )
     a = torch.tensor(actions, dtype=torch.long).view(BATCH_SIZE, ARCH["num_frames"], 1)
-    s_target = torch.tensor(next_states, dtype=torch.float32).view(
-        BATCH_SIZE, ARCH["num_frames"], C, H, W
+    next_6 = torch.tensor(next_states, dtype=torch.float32).view(
+        BATCH_SIZE, ARCH["num_frames"], NUM_ENTITY_CHANNELS, H, W
     )
     y = torch.tensor(labels, dtype=torch.long)
 
-    # Encoder produces g from the unmasked first-person window.
-    g = encoder(s, a)  # (B, layer_size)
-    # Preference classification.
+    # Encoder input: 7-channel watched-agent POV with mask channel = 0
+    enc_input = _add_zero_mask_channel(s_6)
+    g = encoder(enc_input, a)  # (B, layer_size)
     pref_logits = pref_classifier(g)
     pref_loss = F.cross_entropy(pref_logits, y)
     pref_acc = (pref_logits.argmax(1) == y).float().mean()
 
-    # State reconstruction support: random-mask the base's state input, see if
-    # g helps the frozen base predict the next (unmasked) state.
-    state_mask = base.random_mask(s)
-    s_masked = s * state_mask.float()
-    state_preds, _ = base.forward(s_masked, a, belief_embedding=g)
+    # Base input: outer-ring-masked + mask channel = 1 in outer ring.
+    base_input = _add_mask_channel(s_6, OUTER_RING_2D)
+    # Target: FULL next state padded with zero mask channel.
+    s_target = _add_zero_mask_channel(next_6)
+
+    state_preds, _ = base.forward(base_input, a, belief_embedding=g)
     state_loss = base.state_loss(state_preds, s_target, mask=None)
 
     loss = RECON_LOSS_WEIGHT * state_loss + PREF_LOSS_WEIGHT * pref_loss

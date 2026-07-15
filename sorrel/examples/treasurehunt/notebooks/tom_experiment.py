@@ -58,9 +58,20 @@ WATCHED_CONFIGS = ["gem_only", "food_only", "both", "none"]
 BELIEF_OPTIONS = [True, False]
 
 
-def run_trial(watched_config: str, belief_on: bool, seed: int, save_gif: bool = False):
+def run_trial(
+    watched_config: str,
+    belief_on: bool,
+    seed: int,
+    save_gif: bool = False,
+    mode: str | None = None,
+    g_override=None,
+):
     env, observer = build_env(
-        watched_config=watched_config, belief_on=belief_on, seed=seed
+        watched_config=watched_config,
+        belief_on=belief_on,
+        seed=seed,
+        mode=mode,
+        g_override=g_override,
     )
     start_y, start_x, _ = observer.location
     renderer = (

@@ -43,8 +43,9 @@ EPISODE_LEN_VIZ = 60  # long enough for window to fill even when watched agents 
 SEED = 100
 WATCHED_CONFIGS = ["gem_only", "food_only", "both", "none"]
 
-# (C, H, W) channel order matches ENTITY_LIST in tom_rollout
-ENTITY_NAMES = ["EmptyEntity", "Wall", "Gem", "Bone", "Food", "Agent"]
+# Channel order matches ENTITY_LIST in tom_rollout. Channel 6 (mask) is the
+# observer's "unknown" indicator and is rendered specially (not via this list).
+ENTITY_NAMES = ["EmptyEntity", "Wall", "Gem", "Bone", "Food", "Agent", "Mask"]
 COLORS = [
     (0.94, 0.92, 0.84),  # 0 EmptyEntity - sand
     (0.30, 0.30, 0.30),  # 1 Wall        - dark grey
@@ -52,7 +53,9 @@ COLORS = [
     (0.85, 0.30, 0.30),  # 3 Bone        - red
     (0.30, 0.75, 0.40),  # 4 Food        - green
     (0.95, 0.85, 0.30),  # 5 Agent       - yellow
+    (0.08, 0.08, 0.10),  # 6 Mask        - near-black (drawn explicitly below)
 ]
+NUM_ENTITY_CHANNELS = 6  # channels 0..5 are entities; channel 6 is the mask
 MASKED_COLOR = (0.08, 0.08, 0.10)  # near-black for "observer cannot see this cell"
 
 # Subtle red tint on outer-ring cells in the belief-completed panel so it's
@@ -61,27 +64,36 @@ RING_TINT_STRENGTH = 0.28
 
 
 def pov_to_rgb(pov: np.ndarray, mark_outer_ring_as_belief: bool = False) -> np.ndarray:
-    """Render a (C, H, W) one-hot POV to an RGB image (H, W, 3).
+    """Render a (C, H, W) POV to an RGB image (H, W, 3).
 
-    Masked cells (all channels 0) render as near-black. If
-    mark_outer_ring_as_belief is True, every outer-ring cell (chebyshev
-    distance > ACTUAL_FOV_RADIUS from center) is rendered with the entity
-    color tinted toward red, so reconstructed content is visually distinct
-    from directly observed content.
+    Channels 0..5 are entity channels (one-hot); channel 6 is the mask channel
+    (1 where the observer cannot see the cell). Rendering rules:
+      - mask channel = 1: render as near-black (truly hidden).
+      - entity channels all 0 AND mask channel = 0: EmptyEntity (sand).
+      - otherwise: argmax over entity channels gives the entity color.
+    If mark_outer_ring_as_belief is True, outer-ring cells that DO have an
+    entity (i.e. reconstructed content) are tinted red so they're visually
+    distinct from directly observed cells.
     """
     C, H, W = pov.shape
     cy, cx = H // 2, W // 2
     rgb = np.full((H, W, 3), MASKED_COLOR, dtype=np.float32)
+    has_mask_channel = C > NUM_ENTITY_CHANNELS
     for y in range(H):
         for x in range(W):
-            channel_sum = pov[:, y, x].sum()
-            if channel_sum < 0.5:
+            # If the dedicated mask channel says this cell is hidden, draw black.
+            if has_mask_channel and pov[NUM_ENTITY_CHANNELS, y, x] > 0.5:
+                rgb[y, x] = MASKED_COLOR
                 continue
-            ch = int(pov[:, y, x].argmax())
+            entity_sum = pov[:NUM_ENTITY_CHANNELS, y, x].sum()
+            if entity_sum < 0.5:
+                # No entity, not masked -> EmptyEntity (sand)
+                rgb[y, x] = np.array(COLORS[0], dtype=np.float32)
+                continue
+            ch = int(pov[:NUM_ENTITY_CHANNELS, y, x].argmax())
             base_color = np.array(COLORS[ch], dtype=np.float32)
             in_outer_ring = max(abs(y - cy), abs(x - cx)) > ACTUAL_FOV_RADIUS
             if mark_outer_ring_as_belief and in_outer_ring:
-                # Mix base_color toward a warm red tint to mark "this is belief".
                 tint = np.array([0.95, 0.40, 0.40], dtype=np.float32)
                 rgb[y, x] = (1 - RING_TINT_STRENGTH) * base_color + RING_TINT_STRENGTH * tint
             else:
@@ -265,7 +277,7 @@ def run_one(watched_config: str) -> dict:
     # Aggregate per-step outer-ring channel composition (the diagnostic).
     # ring_argmax_counts[c] = how many cells got argmax channel c summed over
     # all frames in which a belief was computed.
-    ring_argmax_counts = np.zeros(ARCH["state_size"][0], dtype=np.int64)
+    ring_argmax_counts = np.zeros(NUM_ENTITY_CHANNELS, dtype=np.int64)
     n_belief_frames = 0
     H = ARCH["state_size"][1]
     cy = H // 2
@@ -282,9 +294,12 @@ def run_one(watched_config: str) -> dict:
             render_frame(env.world, observer, observer.watched_agents, turn, watched_config)
         )
         if observer.last_belief_was_used and observer.last_completed_pov is not None:
+            # argmax over ENTITY channels (0..5) only; the mask channel is a
+            # separate book-keeping channel and shouldn't enter the histogram.
+            entity_only = observer.last_completed_pov[:NUM_ENTITY_CHANNELS]
             ring_argmax_counts += np.bincount(
-                observer.last_completed_pov.argmax(0)[outer_ring_mask],
-                minlength=ARCH["state_size"][0],
+                entity_only.argmax(0)[outer_ring_mask],
+                minlength=NUM_ENTITY_CHANNELS,
             )
             n_belief_frames += 1
         if env.world.is_done:
@@ -315,7 +330,11 @@ def main() -> None:
     print("=" * 78)
     print("OUTER-RING ARGMAX COMPOSITION (over the rollout, % of outer-ring cells)")
     print("=" * 78)
-    header = f"{'watched':<12s}" + "".join(f"{name:>10s}" for name in ENTITY_NAMES)
+    # Only entity-channel columns are reported in the diagnostic; the mask
+    # channel is bookkeeping, not a real entity.
+    header = f"{'watched':<12s}" + "".join(
+        f"{name:>10s}" for name in ENTITY_NAMES[:NUM_ENTITY_CHANNELS]
+    )
     print(header)
     print("-" * len(header))
     for row in summary:

@@ -151,3 +151,9 @@ pyvenv.cfg
 /bin
 /share
 tests/
+
+
+
+CLAUDE.md
+
+*.pkl
