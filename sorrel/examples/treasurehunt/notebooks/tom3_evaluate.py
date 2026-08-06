@@ -52,8 +52,9 @@ SEED0 = 100_000  # disjoint from training seeds
 rng = np.random.default_rng(0)
 
 
-def load_observer(k: int):
-    ckpt = torch.load(observer_ckpt(k), map_location="cpu")
+def load_observer(k: int, checkpoint=None):
+    """Load the baseline checkpoint, or an explicitly supplied variant."""
+    ckpt = torch.load(checkpoint or observer_ckpt(k), map_location="cpu")
     encoder = BeliefEncoder(**ckpt["arch"], device="cpu")
     encoder.load_state_dict(ckpt["encoder"])
     encoder.eval()

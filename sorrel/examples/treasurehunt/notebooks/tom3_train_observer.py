@@ -28,6 +28,7 @@ from sorrel.examples.treasurehunt.notebooks.tom3_common import (
     T_WATCH,
     dataset_path,
     observer_ckpt,
+    visibility_observer_ckpt,
 )
 from sorrel.models.pytorch.transformer import BeliefEncoder
 
@@ -42,6 +43,13 @@ LR = 1e-3
 WARMUP_STEPS = 300  # linear LR warmup (post-LN transformer cold-start fix)
 TRUNC_START = 500  # no truncation augmentation during the fragile phase
 TRUNC_PROB = 0.5  # fraction of desire windows truncated after TRUNC_START
+# Variant-only augmentation: unlike ``truncate``, which freezes the whole
+# third-person scene, this removes only the tracked partner's marker/action
+# evidence after a sampled point. The shared frames continue to show the
+# other agent and world evolving, matching the partial FOV-gated evidence that
+# drove multi-agent errors in the norm spatial audit.
+VISIBILITY_PROB = 0.75
+VISIBILITY_MIN_STEPS = 4
 # MPS is ~3x faster than CPU for this encoder on Apple silicon (verified
 # numerically equivalent to CPU: forward ~1e-7, grads ~1e-8).
 # A launchd background job cannot always obtain a usable MPS context even
@@ -104,6 +112,21 @@ def truncate(frames: torch.Tensor, disp: torch.Tensor, t: int):
     return frames, disp
 
 
+def mask_tracked_suffix(frames: torch.Tensor, disp: torch.Tensor, t: int):
+    """Hide the tracked partner after ``t`` while retaining scene evolution.
+
+    The tracked-agent marker is the final input channel. Later displacements
+    are changed to STAY, precisely the representation used when an agent is
+    outside the observer's FOV. Unlike :func:`truncate`, all non-marker image
+    channels are retained, including other agents' behavior.
+    """
+    frames = frames.clone()
+    disp = disp.clone()
+    frames[:, t:, -1, :, :] = 0.0
+    disp[:, t:] = DISP_STAY
+    return frames, disp
+
+
 def batch_tensors(data, idx):
     frames = torch.tensor(data["frames"][idx], dtype=torch.float32, device=DEVICE)
     disp = torch.tensor(data["disp"][idx], dtype=torch.long, device=DEVICE).unsqueeze(
@@ -129,9 +152,11 @@ def evaluate(encoder, desire_head, latent_head, data, t: int | None = None, bs=2
     return d_correct / n, l_correct / n
 
 
-def train(k: int) -> None:
-    steps = STEPS[k]
-    print(f"===== K={k} ({steps} steps, device={DEVICE}) =====")
+def train(k: int, *, variant: str = "baseline", steps_override: int | None = None) -> None:
+    if variant not in {"baseline", "visibility"}:
+        raise ValueError(f"Unknown ToM training variant: {variant}")
+    steps = steps_override or STEPS[k]
+    print(f"===== K={k} ({steps} steps, device={DEVICE}, variant={variant}) =====")
     tr, va = load_split(k)
     n_train = len(tr["desire"])
 
@@ -185,6 +210,12 @@ def train(k: int) -> None:
                 t = int(np.random.randint(2, T_WATCH + 1))
                 if t < T_WATCH:
                     desire_frames, desire_disp = truncate(frames, disp, t)
+            if step >= TRUNC_START and variant == "visibility" and np.random.random() < VISIBILITY_PROB:
+                t = int(np.random.randint(VISIBILITY_MIN_STEPS, T_WATCH + 1))
+                if t < T_WATCH:
+                    desire_frames, desire_disp = mask_tracked_suffix(
+                        desire_frames, desire_disp, t
+                    )
             g = encoder(frames, disp)
             g_desire = (
                 g
@@ -240,7 +271,7 @@ def train(k: int) -> None:
         print(f"  {t:>4}{d_acc * 100:>9.1f}%{l_acc * 100:>9.1f}%")
     writer.close()
 
-    ckpt = observer_ckpt(k)
+    ckpt = observer_ckpt(k) if variant == "baseline" else visibility_observer_ckpt(k)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -250,6 +281,7 @@ def train(k: int) -> None:
             "latent_head": latent_head.state_dict(),
             "arch": ARCH,
             "k": k,
+            "variant": variant,
         },
         ckpt,
     )

@@ -62,6 +62,15 @@ def observer_ckpt(k: int) -> Path:
     return DATA_DIR / f"checkpoints/tom3_observer_k{k}.pt"
 
 
+def visibility_observer_ckpt(k: int) -> Path:
+    """Checkpoint for the partial/FOV-gated-evidence training variant.
+
+    Kept separate from :func:`observer_ckpt` so the validated baseline can
+    always be re-evaluated unchanged.
+    """
+    return DATA_DIR / f"checkpoints/tom3_observer_visibility_k{k}.pt"
+
+
 def pref_for(desire: int) -> dict[str, float]:
     """Preference dict for a desire index: 1.0 on the preferred kind, 0.2 on
     every other item kind, 1.0 on Bone (so its -10 value stays a penalty)."""
